@@ -1,0 +1,9 @@
+# 这是 wrangler.toml 文件的内容
+
+name = "openwebui-proxy" # 你可以为你 Cloudflare Worker 服务取一个喜欢的名字，这个名字也会是 .workers.dev 子域名的一部分
+main = "openwebui.js"  # 指定了你的主 Worker 脚本文件
+compatibility_date = "2025-05-17" # 使用一个近期的兼容性日期
+
+# 可选：如果 Cloudflare 部署时仍然提示需要账户 ID，可以取消下面一行的注释并填入你的 Cloudflare Account ID
+# 你可以在 Cloudflare 仪表盘主页的右侧找到你的 Account ID
+# account_id = "你的Cloudflare账户ID"
