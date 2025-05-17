@@ -1,6 +1,6 @@
 export default {
   async fetch(request) {
-    const targetBaseUrl = "https://libabaasdasd21312asda-web.hf.space";
+    const targetBaseUrl = "https://dondxjpjwzow.ap-northeast-1.clawcloudrun.com/";
     const originalUrl = new URL(request.url);
 
     // 构建指向目标服务器的完整 URL
