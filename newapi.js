@@ -1,5 +1,5 @@
 // --- 配置区域 ---
-const TARGET_BASE_URL = "https://dondxjpjwzow.ap-northeast-1.clawcloudrun.com/";
+const TARGET_BASE_URL = "https://dondxjpjwzow.ap-northeast-1.clawcloudrun.com";
 // 从 TARGET_BASE_URL 自动提取协议和主机名
 const TARGET_URL_PARSED = new URL(TARGET_BASE_URL);
 const TARGET_SCHEME = TARGET_URL_PARSED.protocol.slice(0, -1); // 'http' or 'https'
