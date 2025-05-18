@@ -1,13 +1,20 @@
 // --- 配置区域 ---
 const TARGET_BASE_URL = "https://dondxjpjwzow.ap-northeast-1.clawcloudrun.com/";
-// 从 TARGET_BASE_URL 自动提取协议 (http 或 https) 和主机名
+// 从 TARGET_BASE_URL 自动提取协议和主机名
 const TARGET_URL_PARSED = new URL(TARGET_BASE_URL);
-const TARGET_SCHEME = TARGET_URL_PARSED.protocol.slice(0, -1);
+const TARGET_SCHEME = TARGET_URL_PARSED.protocol.slice(0, -1); // 'http' or 'https'
 const TARGET_HOSTNAME = TARGET_URL_PARSED.hostname;
 
 // --- 日志记录函数 (可选，用于调试) ---
-function log(message) {
-  console.log(`[${new Date().toISOString()}] ${message}`);
+function log(level, message, data = '') {
+  // 在 Cloudflare Workers 中，可以直接使用 console.log, console.error 等
+  // 对于生产环境，您可能希望将日志发送到第三方日志服务
+  const logMessage = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}`;
+  if (data) {
+    console[level.toLowerCase()] ? console[level.toLowerCase()](logMessage, data) : console.log(logMessage, data);
+  } else {
+    console[level.toLowerCase()] ? console[level.toLowerCase()](logMessage) : console.log(logMessage);
+  }
 }
 
 // --- Cloudflare Worker 入口 ---
@@ -18,76 +25,107 @@ export default {
     // 判断是否为 WebSocket 升级请求
     const upgradeHeader = request.headers.get('Upgrade');
     if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
-      // 如果 "newapi" 不需要 WebSocket，您可以移除或注释掉此部分和 handleWebSocket 函数
-      return handleWebSocket(request, originalUrl);
+      // 如果 "newapi" 明确不需要 WebSocket，您可以移除或注释掉此部分和 handleWebSocket 函数
+      return handleWebSocket(request, originalUrl, ctx, env);
     } else {
       // 处理普通的 HTTP/HTTPS 请求
-      return handleHttpRequest(request, originalUrl);
+      return handleHttpRequest(request, originalUrl, ctx, env);
     }
   },
 };
 
 // --- HTTP/HTTPS 请求处理函数 ---
-async function handleHttpRequest(request, originalUrl) {
+async function handleHttpRequest(request, originalUrl, ctx, env) {
   // 构建指向目标服务器的完整 URL
-  const targetUrl = new URL(TARGET_BASE_URL); // 使用原始 TARGET_BASE_URL 以保留其路径部分 (如果有)
-  targetUrl.pathname = (TARGET_URL_PARSED.pathname.endsWith('/') ? TARGET_URL_PARSED.pathname.slice(0, -1) : TARGET_URL_PARSED.pathname) + 
-                       (originalUrl.pathname.startsWith('/') ? originalUrl.pathname : '/' + originalUrl.pathname);
-  targetUrl.search = originalUrl.search;
+  // 确保正确合并 TARGET_BASE_URL 的路径部分和客户端请求的路径
+  let basePath = TARGET_URL_PARSED.pathname;
+  if (basePath.endsWith('/')) {
+    basePath = basePath.slice(0, -1);
+  }
+  let requestPath = originalUrl.pathname;
+  if (!requestPath.startsWith('/')) {
+    requestPath = '/' + requestPath;
+  }
+  const targetPath = basePath + requestPath;
 
+  const targetUrl = new URL(targetPath, TARGET_BASE_URL); // 使用 URL 构造函数正确处理路径合并
+  targetUrl.search = originalUrl.search; // 复制查询参数
 
-  log(`HTTP Request: ${request.method} ${originalUrl.pathname}${originalUrl.search} -> ${targetUrl.toString()}`);
+  log('INFO', `HTTP Request: ${request.method} ${originalUrl.pathname}${originalUrl.search} -> ${targetUrl.toString()}`);
 
   // 准备新的请求头
   const requestHeaders = new Headers(request.headers);
-  requestHeaders.set('Host', TARGET_HOSTNAME); // 非常重要：设置目标服务器的 Host 头部
-  requestHeaders.set('X-Forwarded-Host', originalUrl.hostname); // 告知后端最初请求的主机
-  requestHeaders.set('X-Forwarded-Proto', originalUrl.protocol.slice(0, -1)); // 告知后端最初的协议
+  requestHeaders.set('Host', TARGET_HOSTNAME);
+  // 添加 X-Forwarded-* 头部，让后端了解原始请求信息
+  requestHeaders.set('X-Forwarded-Host', originalUrl.hostname);
+  requestHeaders.set('X-Forwarded-Proto', originalUrl.protocol.slice(0, -1));
+  const clientIp = request.headers.get('CF-Connecting-IP'); // Cloudflare 提供的客户端真实 IP
+  if (clientIp) {
+    requestHeaders.set('X-Forwarded-For', clientIp);
+  }
 
   // 清理一些 Cloudflare 特有的、不应发送到源的头部
-  requestHeaders.delete('cf-connecting-ip');
-  requestHeaders.delete('cf-ipcountry');
-  requestHeaders.delete('cf-ray');
-  requestHeaders.delete('cf-visitor');
-  requestHeaders.delete('x-real-ip'); // 通常由 cf-connecting-ip 代替
-  requestHeaders.delete('cdn-loop'); // 避免代理循环
+  ['cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker', 'cdn-loop', 'x-real-ip'].forEach(h => requestHeaders.delete(h));
 
-  // 如果您的 "newapi" 对 User-Agent 或 Origin 敏感，您可能需要在此处添加特定的修改逻辑
-  // 例如: requestHeaders.set('User-Agent', 'MyCustomUserAgent/1.0');
+  // 如果 "newapi" 对 User-Agent 或 Origin 敏感，您可能需要在此处添加特定的修改逻辑
+  // 例如: requestHeaders.set('User-Agent', 'MyCustomProxy/1.0');
   // 例如: requestHeaders.set('Origin', TARGET_URL_PARSED.origin);
 
+  // --- 缓存策略 (示例，仅对 GET 请求且源服务器允许缓存时) ---
+  // 注意：API 代理的缓存需要非常小心，确保不会缓存动态或私有数据
+  const cache = caches.default;
+  let response;
 
-  let originResponse;
+  if (request.method === 'GET') {
+    try {
+      response = await cache.match(request.clone()); // 尝试从缓存中获取
+    } catch (cacheError) {
+      log('WARN', 'Cache API match error (continuing without cache):', cacheError.message);
+    }
+  }
+
+  if (response) {
+    log('INFO', `Cache hit for: ${request.url}`);
+    // 可以选择性地为缓存命中的响应添加一个头部，方便调试
+    // const cachedResponseHeaders = new Headers(response.headers);
+    // cachedResponseHeaders.set('X-Worker-Cache', 'HIT');
+    // return new Response(response.body, { ...response, headers: cachedResponseHeaders });
+    return response;
+  }
+  log('INFO', `Cache miss or non-GET for: ${request.url}`);
+
   try {
-    originResponse = await fetch(targetUrl.toString(), {
+    const originResponse = await fetch(targetUrl.toString(), {
       method: request.method,
       headers: requestHeaders,
       body: (request.method !== 'GET' && request.method !== 'HEAD') ? request.body : undefined,
-      redirect: 'manual', // 与您脚本中的设置一致，代理将重定向传递给客户端处理
+      redirect: 'manual', // 代理将重定向传递给客户端处理
     });
 
     // 复制响应头以便修改
     let responseHeaders = new Headers(originResponse.headers);
 
     // --- CORS 头部处理 ---
-    // 谨慎配置： "*" 允许所有来源，但如果需要凭据，则不能为 "*"
-    const clientOrigin = request.headers.get('Origin');
-    if (clientOrigin) {
-      responseHeaders.set('Access-Control-Allow-Origin', clientOrigin); // 更安全：允许请求的来源
-      responseHeaders.set('Vary', 'Origin'); // 告知缓存，响应随 Origin 头部变化
+    const requestOrigin = request.headers.get('Origin');
+    if (requestOrigin) {
+      responseHeaders.set('Access-Control-Allow-Origin', requestOrigin);
+      responseHeaders.set('Vary', 'Origin');
     } else {
-      responseHeaders.set('Access-Control-Allow-Origin', '*'); // 降级为允许所有（如果客户端未发送Origin）
+      // 如果没有 Origin 请求头 (例如非浏览器请求)，可以允许所有或特定配置的来源
+      responseHeaders.set('Access-Control-Allow-Origin', '*'); // 或更严格的默认值
     }
-    responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-    // 根据 "newapi" 实际需要的头部进行调整
-    responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Custom-Header, Range');
-    // 如果您的应用需要 cookie 或 Authorization 头部进行跨域请求
-    responseHeaders.set('Access-Control-Allow-Credentials', 'true');
+    responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD');
+    responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range, Accept, Origin, X-Requested-With, X-Custom-Header'); // 增加常见头部
+    responseHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Date, ETag, Vary'); // 暴露一些常用头部
+    // 如果需要凭据，Access-Control-Allow-Origin 不能是 '*'
+    if (responseHeaders.get('Access-Control-Allow-Origin') !== '*') {
+        responseHeaders.set('Access-Control-Allow-Credentials', 'true');
+    }
 
 
     // --- OPTIONS 请求预检处理 ---
-    // 如果是 OPTIONS 请求 (CORS 预检)，并且我们已经设置了上面的 CORS 头部，可以直接返回 204 No Content
     if (request.method === 'OPTIONS') {
+      // 已经添加了上述 CORS 头部
       return new Response(null, {
         status: 204, // No Content
         headers: responseHeaders,
@@ -97,24 +135,37 @@ async function handleHttpRequest(request, originalUrl) {
     // --- 处理源服务器的重定向响应 ---
     if (originResponse.status >= 300 && originResponse.status < 400 && responseHeaders.has('location')) {
       const location = responseHeaders.get('location');
-      // 如果 location 是相对路径，或者指向了原始的 TARGET_BASE_URL，通常不需要修改
-      // 如果 location 是绝对路径且指向了其他域名，或者需要将 TARGET_BASE_URL 替换为 Worker 的 URL，则可能需要重写
-      // 为简单起见，此处直接透传（大部分情况下是期望行为）
-      log(`Redirecting: ${originResponse.status} to ${location}`);
+      log('INFO', `Redirecting: ${originResponse.status} to ${location}`);
+      // 通常直接透传，如果需要修改 location URL（例如，从内部域名到公共域名），可以在此处理
       return new Response(null, {
         status: originResponse.status,
         headers: responseHeaders,
       });
     }
 
-    // --- 可选：添加一些安全相关的响应头 ---
-    // responseHeaders.set('X-Content-Type-Options', 'nosniff');
-    // responseHeaders.set('X-Frame-Options', 'DENY');
-    // responseHeaders.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; object-src 'none';");
-    // responseHeaders.delete('X-Powered-By'); // 移除后端指纹信息
+    // --- 添加基础的安全响应头 (如果源服务器没有提供的话) ---
+    if (!responseHeaders.has('X-Content-Type-Options')) responseHeaders.set('X-Content-Type-Options', 'nosniff');
+    if (!responseHeaders.has('X-Frame-Options')) responseHeaders.set('X-Frame-Options', 'DENY');
+    // CSP 策略需要根据 "newapi" 的内容仔细配置，此处仅为示例
+    // if (!responseHeaders.has('Content-Security-Policy')) responseHeaders.set('Content-Security-Policy', "default-src 'self'; object-src 'none'; frame-ancestors 'none';");
+    responseHeaders.delete('X-Powered-By'); // 移除可能的后端技术指纹
 
 
-    // 创建新的响应对象并返回
+    // --- 缓存响应 (示例，仅对 GET 请求且源服务器指示可缓存时) ---
+    if (request.method === 'GET' && originResponse.ok) {
+      // 检查源服务器是否允许缓存 (例如通过 Cache-Control 头部)
+      const cacheControl = originResponse.headers.get('Cache-Control');
+      const pragma = originResponse.headers.get('Pragma');
+      if (cacheControl && !cacheControl.includes('no-cache') && !cacheControl.includes('no-store') && !cacheControl.includes('private') &&
+          pragma !== 'no-cache') {
+        // 克隆响应用于缓存，因为响应体只能使用一次
+        const responseToCache = originResponse.clone();
+        // 异步写入缓存，不阻塞对客户端的响应
+        ctx.waitUntil(cache.put(request.clone(), responseToCache));
+        log('INFO', `Response eligible for caching: ${request.url}`);
+      }
+    }
+    
     return new Response(originResponse.body, {
       status: originResponse.status,
       statusText: originResponse.statusText,
@@ -122,22 +173,28 @@ async function handleHttpRequest(request, originalUrl) {
     });
 
   } catch (e) {
-    log(`CF Worker HTTP Proxy fetch error: ${e.name} - ${e.message}. URL: ${targetUrl.toString()}`);
-    // 可以根据错误类型返回更具体的错误信息给客户端
-    return new Response(`Proxy error: Could not connect to target service. (${e.message})`, { status: 502 }); // 502 Bad Gateway
+    log('ERROR', `CF Worker HTTP Proxy fetch error: ${e.name} - ${e.message}. URL: ${targetUrl.toString()}`, e.stack);
+    return new Response(`Proxy error: Could not connect to target service. (${e.message})`, { status: 502 });
   }
 }
 
 // --- WebSocket 请求处理函数 ---
-// 如果 "newapi" 明确不需要 WebSocket，可以移除此函数和 fetch 入口处的判断
-async function handleWebSocket(request, originalUrl) {
-  const targetUrl = new URL(TARGET_BASE_URL);
-  targetUrl.pathname = (TARGET_URL_PARSED.pathname.endsWith('/') ? TARGET_URL_PARSED.pathname.slice(0, -1) : TARGET_URL_PARSED.pathname) + 
-                       (originalUrl.pathname.startsWith('/') ? originalUrl.pathname : '/' + originalUrl.pathname);
-  targetUrl.search = originalUrl.search;
-  targetUrl.protocol = TARGET_SCHEME === 'https' ? 'wss' : 'ws'; // 切换到 ws/wss 协议
+async function handleWebSocket(request, originalUrl, ctx, env) {
+  let basePath = TARGET_URL_PARSED.pathname;
+  if (basePath.endsWith('/')) {
+    basePath = basePath.slice(0, -1);
+  }
+  let requestPath = originalUrl.pathname;
+  if (!requestPath.startsWith('/')) {
+    requestPath = '/' + requestPath;
+  }
+  const targetPath = basePath + requestPath;
 
-  log(`WebSocket Upgrade: ${originalUrl.pathname}${originalUrl.search} -> ${targetUrl.toString()}`);
+  const targetUrl = new URL(targetPath, TARGET_BASE_URL);
+  targetUrl.search = originalUrl.search;
+  targetUrl.protocol = TARGET_SCHEME === 'https' ? 'wss' : 'ws';
+
+  log('INFO', `WebSocket Upgrade: ${originalUrl.pathname}${originalUrl.search} -> ${targetUrl.toString()}`);
 
   const webSocketPair = new WebSocketPair();
   const clientWs = webSocketPair[0];
@@ -148,16 +205,18 @@ async function handleWebSocket(request, originalUrl) {
   const originWsHeaders = new Headers();
   originWsHeaders.set('Host', TARGET_HOSTNAME);
   originWsHeaders.set('Upgrade', 'websocket');
-  // 通常 fetch 会自动处理 Connection: Upgrade
 
-  // 透传必要的 Sec-WebSocket-* 头部
-  const requiredWsHeaders = ['Sec-WebSocket-Key', 'Sec-WebSocket-Version', 'Sec-WebSocket-Protocol', 'User-Agent', 'Origin'];
-  for (const headerName of requiredWsHeaders) {
+  // 透传必要的或推荐的头部
+  const headersToForward = [
+    'Sec-WebSocket-Key', 'Sec-WebSocket-Version', 'Sec-WebSocket-Protocol',
+    'User-Agent', 'Origin', 'Cookie', 'Authorization' // Cookie 和 Auth 根据需要
+  ];
+  for (const headerName of headersToForward) {
     if (request.headers.has(headerName)) {
       originWsHeaders.set(headerName, request.headers.get(headerName));
     }
   }
-  // 如果客户端没有发送 Origin，但目标服务需要，可以考虑在此处设置一个默认的 Origin:
+  // 如果客户端未发送 Origin，但目标服务需要，可以考虑在此处设置一个默认的 Origin:
   // if (!originWsHeaders.has('Origin') && TARGET_URL_PARSED.origin !== 'null') {
   //   originWsHeaders.set('Origin', TARGET_URL_PARSED.origin);
   // }
@@ -170,7 +229,7 @@ async function handleWebSocket(request, originalUrl) {
 
     const originSocket = originResponse.webSocket;
     if (!originSocket) {
-      log(`WebSocket origin did not upgrade. Status: ${originResponse.status}. URL: ${targetUrl.toString()}`);
+      log('ERROR', `WebSocket origin did not upgrade. Status: ${originResponse.status}. URL: ${targetUrl.toString()}`);
       let errorBody = `WebSocket origin did not upgrade. Status: ${originResponse.status}.`;
       try { errorBody += " Body: " + await originResponse.text(); } catch (e) {}
       serverWs.close(1011, "Origin did not upgrade to WebSocket");
@@ -183,18 +242,18 @@ async function handleWebSocket(request, originalUrl) {
     originSocket.addEventListener('message', event => {
       try {
         if (serverWs.readyState === WebSocket.OPEN) serverWs.send(event.data);
-      } catch (e) { log(`Error serverWs.send: ${e}`); }
+      } catch (e) { log('ERROR', `Error serverWs.send: ${e}`, e.stack); }
     });
     serverWs.addEventListener('message', event => {
       try {
         if (originSocket.readyState === WebSocket.OPEN) originSocket.send(event.data);
-      } catch (e) { log(`Error originSocket.send: ${e}`); }
+      } catch (e) { log('ERROR', `Error originSocket.send: ${e}`, e.stack); }
     });
 
     const commonCloseOrErrorHandler = (wsSide, otherWs, event, type) => {
       const code = event.code || (type === 'error' ? 1011 : 1000);
-      const reason = event.reason || (type === 'error' ? 'WebSocket error on ' + wsSide : 'WebSocket connection closed on ' + wsSide);
-      log(`${wsSide} WebSocket ${type}: Code ${code}, Reason: '${reason}'`);
+      const reason = event.reason || (type === 'error' ? `WebSocket error on ${wsSide}` : `WebSocket connection closed on ${wsSide}`);
+      log('INFO', `${wsSide} WebSocket ${type}: Code ${code}, Reason: '${reason}'`);
       if (otherWs.readyState === WebSocket.OPEN || otherWs.readyState === WebSocket.CONNECTING) {
         otherWs.close(code, reason);
       }
@@ -204,7 +263,7 @@ async function handleWebSocket(request, originalUrl) {
     serverWs.addEventListener('close', event => commonCloseOrErrorHandler('Client', originSocket, event, 'close'));
     originSocket.addEventListener('error', event => commonCloseOrErrorHandler('Origin', serverWs, event, 'error'));
     serverWs.addEventListener('error', event => commonCloseOrErrorHandler('Client', originSocket, event, 'error'));
-
+    
     const responseHeaders = new Headers();
     if (originResponse.headers.has('sec-websocket-protocol')) {
         responseHeaders.set('sec-websocket-protocol', originResponse.headers.get('sec-websocket-protocol'));
@@ -217,10 +276,11 @@ async function handleWebSocket(request, originalUrl) {
     });
 
   } catch (error) {
-    log(`WebSocket connection to origin error: ${error.name} - ${error.message}`);
+    log('ERROR', `WebSocket connection to origin error: ${error.name} - ${error.message}`, error.stack);
     if (serverWs && serverWs.readyState !== WebSocket.CLOSED && serverWs.readyState !== WebSocket.CLOSING) {
         serverWs.close(1011, `Proxy to origin failed: ${error.message}`);
     }
     return new Response(`WebSocket Proxy Error: ${error.message}`, { status: 502 });
   }
 }
+
