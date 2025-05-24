@@ -2,7 +2,7 @@
 // 目标 API 的基础 URL
 // 重要提示：如果您的 targetBaseUrlString 包含路径 (例如 https://api.example.com/v1)，
 // 此脚本中的路径处理逻辑能够正确地将其与请求路径合并。
-const TARGET_BASE_URL_STRING = "https://dondxjpjwzow.ap-northeast-1.clawcloudrun.com";
+const TARGET_BASE_URL_STRING = "https://libabaasdasd21312asda-veloera.hf.space";
 
 // --- 日志记录函数 (可选，用于调试) ---
 function log(level, message, data = '') {
